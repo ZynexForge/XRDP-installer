@@ -2,7 +2,7 @@
 # ============================================================================
 # ZynexForge: zforge-xrdp
 # Production-Grade XRDP Automation with Relay Tunnel
-# Version: 2.3.0
+# Version: 2.4.0
 # ============================================================================
 
 set -euo pipefail
@@ -298,41 +298,33 @@ EOF
 get_relay_public_ip() {
     log_info "Retrieving relay server public IP..."
     
-    # Try multiple methods to get relay IP
+    # Try to resolve the relay server domain
     local relay_ip=""
     
-    # Method 1: Try to resolve domain
-    if command -v dig &>/dev/null; then
-        relay_ip=$(dig +short "$RELAY_SERVER" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    # First try: Use getent (most reliable on Linux)
+    if command -v getent &>/dev/null; then
+        relay_ip=$(getent ahosts "$RELAY_SERVER" 2>/dev/null | grep STREAM | awk '{print $1}' | head -1)
     fi
     
-    # Method 2: Try nslookup
-    if [[ -z "$relay_ip" ]] && command -v nslookup &>/dev/null; then
-        relay_ip=$(nslookup "$RELAY_SERVER" 2>/dev/null | grep -E 'Address: [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | head -1)
+    # Second try: Use host command
+    if [[ -z "$relay_ip" ]] && command -v host &>/dev/null; then
+        relay_ip=$(host "$RELAY_SERVER" 2>/dev/null | grep "has address" | awk '{print $NF}' | head -1)
     fi
     
-    # Method 3: Try getent
-    if [[ -z "$relay_ip" ]] && command -v getent &>/dev/null; then
-        relay_ip=$(getent ahosts "$RELAY_SERVER" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $1}' | head -1)
-    fi
-    
-    # Method 4: Try ping (just for resolution)
+    # Third try: Use ping for resolution
     if [[ -z "$relay_ip" ]] && command -v ping &>/dev/null; then
-        relay_ip=$(ping -c 1 -W 1 "$RELAY_SERVER" 2>/dev/null | grep -E 'PING [a-zA-Z0-9.-]+ \([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)' | sed -E 's/.*\(([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\).*/\1/')
+        relay_ip=$(ping -c 1 -W 2 "$RELAY_SERVER" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     fi
     
-    # Method 5: Use curl to external service if domain doesn't resolve
-    if [[ -z "$relay_ip" ]]; then
-        relay_ip=$(curl -s --max-time 5 "https://api.ipify.org" 2>/dev/null || echo "")
-        if [[ -n "$relay_ip" ]]; then
-            log_warn "Could not resolve relay domain, using detected public IP: $relay_ip"
-        fi
+    # Fourth try: Use nslookup
+    if [[ -z "$relay_ip" ]] && command -v nslookup &>/dev/null; then
+        relay_ip=$(nslookup "$RELAY_SERVER" 2>/dev/null | grep Address | tail -1 | awk '{print $2}')
     fi
     
-    # Final fallback
+    # If still no IP, use the domain as fallback
     if [[ -z "$relay_ip" ]]; then
         relay_ip="$RELAY_SERVER"
-        log_warn "Using relay server domain name: $RELAY_SERVER"
+        log_warn "Could not resolve IP, using domain: $RELAY_SERVER"
     else
         log_success "Relay IP resolved: $relay_ip"
     fi
@@ -354,7 +346,7 @@ main() {
     
     # Update package lists first
     log_info "Updating system packages..."
-    apt-get update -qq || log_warn "Package update had issues"
+    apt-get update -qq 2>/dev/null || true
     
     check_dependencies
     
@@ -366,6 +358,9 @@ main() {
     install_xrdp
     setup_tunnel_systemd
     local relay_ip=$(get_relay_public_ip)
+    
+    # Wait a moment for tunnel to fully establish
+    sleep 3
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # FINAL OUTPUT
@@ -383,6 +378,14 @@ main() {
     echo -e "\033[1;33m⚡ Service Status:\033[0m"
     echo -e "  XRDP: $(systemctl is-active xrdp.service)"
     echo -e "  Tunnel: $(systemctl is-active zforge-tunnel.service)"
+    echo -e "\033[1;36m$BANNER\033[0m"
+    
+    # Connection instructions
+    echo -e "\033[1;33m📋 Connection Instructions:\033[0m"
+    echo -e "  1. Open Microsoft Remote Desktop or compatible RDP client"
+    echo -e "  2. Enter the IP address shown above"
+    echo -e "  3. Use the username and password provided"
+    echo -e "  4. Connect and enjoy your XFCE desktop!"
     echo -e "\033[1;36m$BANNER\033[0m"
 }
 
