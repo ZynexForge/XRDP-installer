@@ -1,8 +1,8 @@
 #!/bin/bash
 # ============================================================================
-# ZynexForge: zforge-rdp
-# Production-Grade XRDP Automation Tool
-# Version: 1.0.0
+# ZynexForge: zforge-xrdp
+# Production-Grade XRDP Automation with Relay Tunnel
+# Version: 2.0.0
 # ============================================================================
 
 set -euo pipefail
@@ -10,14 +10,18 @@ set -euo pipefail
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CONFIGURATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-readonly SCRIPT_NAME="zforge-rdp"
+readonly SCRIPT_NAME="zforge-xrdp"
 readonly BANNER="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-readonly MIN_PORT=20000
-readonly MAX_PORT=65535
 readonly USER_PREFIX="zforge"
 readonly XRDP_LOCAL_PORT=3389
 readonly XRDP_LOCAL_IP="127.0.0.1"
-readonly REQUIRED_CMDS=("curl" "systemctl" "iptables" "ss" "openssl" "useradd" "chpasswd")
+readonly RELAY_SERVER="relay.zynexforge.net"
+readonly RELAY_PORT=2222
+readonly TUNNEL_USER="zforge_tunnel"
+readonly TUNNEL_DIR="/opt/zforge-tunnel"
+
+# Required commands
+readonly REQUIRED_CMDS=("ssh" "systemctl" "curl" "wget" "openssl" "useradd" "chpasswd")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # LOGGING & UTILITIES
@@ -45,35 +49,31 @@ check_dependencies() {
     done
     
     if [[ ${#missing[@]} -gt 0 ]]; then
-        die "Missing required commands: ${missing[*]}"
+        log_warn "Installing missing dependencies..."
+        
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq
+            apt-get install -y -qq "${missing[@]}" || die "Failed to install dependencies"
+        elif command -v yum &>/dev/null; then
+            yum install -y -q "${missing[@]}" || die "Failed to install dependencies"
+        else
+            die "Unsupported package manager"
+        fi
+    fi
+}
+
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        echo "$ID"
+    else
+        echo "unknown"
     fi
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CORE FUNCTIONS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-get_public_ip() {
-    log_info "Detecting VPS public IP..."
-    
-    local ip_services=(
-        "https://ifconfig.me"
-        "https://api.ipify.org"
-        "https://icanhazip.com"
-    )
-    
-    local public_ip=""
-    for service in "${ip_services[@]}"; do
-        if public_ip=$(curl -s --max-time 5 "$service" 2>/dev/null | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'); then
-            [[ -n "$public_ip" ]] && break
-        fi
-    done
-    
-    [[ -n "$public_ip" ]] || die "Failed to detect public IP"
-    
-    log_success "Public IP detected: $public_ip"
-    echo "$public_ip"
-}
-
 generate_random_username() {
     local random_suffix=$(openssl rand -hex 3)
     echo "${USER_PREFIX}_${random_suffix}"
@@ -90,17 +90,28 @@ create_linux_user() {
     log_info "Creating Linux user: $username"
     
     if id "$username" &>/dev/null; then
-        log_warn "User $username already exists, skipping creation"
+        log_warn "User $username already exists, reusing"
+        echo "$username:$password" | chpasswd || die "Failed to update password"
         return
     fi
     
-    useradd -m -s /bin/bash "$username" || die "Failed to create user"
+    useradd -m -s /bin/bash -G sudo "$username" || die "Failed to create user"
     echo "$username:$password" | chpasswd || die "Failed to set password"
     
-    # Add user to necessary groups for RDP access
-    usermod -a -G sudo "$username" 2>/dev/null || true
+    # Set up basic X environment
+    mkdir -p /home/"$username"/.config
+    cat > /home/"$username"/.xsession << 'EOF'
+#!/bin/bash
+export GNOME_SHELL_SESSION_MODE=ubuntu
+export XDG_CURRENT_DESKTOP=ubuntu:GNOME
+export XDG_CONFIG_DIRS=/etc/xdg/xdg-ubuntu:/etc/xdg
+export XDG_DATA_DIRS=/usr/share/ubuntu:/usr/local/share:/usr/share:/var/lib/snapd/desktop
+exec startxfce4
+EOF
+    chmod +x /home/"$username"/.xsession
+    chown -R "$username":"$username" /home/"$username"
     
-    log_success "User $username created successfully"
+    log_success "User $username created and configured"
 }
 
 install_xrdp() {
@@ -111,19 +122,22 @@ install_xrdp() {
         return
     fi
     
-    # Detect package manager
-    if command -v apt-get &>/dev/null; then
-        apt-get update || die "Failed to update package list"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp xorgxrdp || die "Failed to install XRDP"
-    elif command -v yum &>/dev/null; then
-        yum install -y xrdp xorgxrdp || die "Failed to install XRDP"
-    elif command -v dnf &>/dev/null; then
-        dnf install -y xrdp xorgxrdp || die "Failed to install XRDP"
+    local os=$(detect_os)
+    
+    if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp \
+            xorgxrdp \
+            xfce4 \
+            xfce4-goodies \
+            firefox-esr \
+            || die "Failed to install XRDP packages"
     else
-        die "Unsupported package manager"
+        die "Unsupported OS: $os"
     fi
     
-    # Configure XRDP to bind only to localhost
+    # Configure XRDP to bind only to localhost with enhanced security
     cat > /etc/xrdp/xrdp.ini << 'EOF'
 [globals]
 bitmap_cache=yes
@@ -132,10 +146,17 @@ port=3389
 crypt_level=high
 channel_code=1
 max_bpp=32
+security_layer=negotiate
+certificate=
+key_file=
+ssl_protocols=TLSv1.2, TLSv1.3
+tls_ciphers=HIGH
+
 [Logging]
 LogFile=xrdp.log
 LogLevel=INFO
 EnableSyslog=yes
+
 [xrdp1]
 name=sesman-Xvnc
 lib=libvnc.so
@@ -145,64 +166,173 @@ ip=127.0.0.1
 port=-1
 EOF
     
+    # Configure session manager
+    cat > /etc/xrdp/sesman.ini << 'EOF'
+[Globals]
+ListenAddress=127.0.0.1
+ListenPort=3350
+EnableUserWindowManager=1
+UserWindowManager=startxfce4
+DefaultWindowManager=startxfce4
+
+[Security]
+AllowRootLogin=yes
+MaxLoginRetry=4
+TerminalServerUsers=tsusers
+TerminalServerAdmins=tsadmins
+
+[Sessions]
+MaxSessions=10
+KillDisconnected=0
+IdleTimeLimit=0
+DisconnectedTimeLimit=0
+
+[X11rdp]
+param1=-bs
+param2=-ac
+param3=-nolisten
+param4=tcp
+
+[Xvnc]
+param1=-bs
+param2=-ac
+param3=-nolisten
+param4=tcp
+param5=-localhost
+param6=-dpi
+param7=96
+EOF
+    
     systemctl enable xrdp || die "Failed to enable XRDP service"
     systemctl restart xrdp || die "Failed to start XRDP service"
     
-    log_success "XRDP installed and configured"
+    # Add user to ssl-cert group for XRDP
+    usermod -a -G ssl-cert "$USERNAME" 2>/dev/null || true
+    
+    log_success "XRDP installed and configured securely"
 }
 
-find_free_port() {
-    local port
-    local max_attempts=50
-    local attempts=0
+install_firefox() {
+    log_info "Installing Firefox..."
     
-    while [[ $attempts -lt $max_attempts ]]; do
-        port=$(( RANDOM % (MAX_PORT - MIN_PORT + 1) + MIN_PORT ))
-        
-        if ! ss -tuln | grep -q ":$port "; then
-            echo "$port"
+    if command -v firefox &>/dev/null || command -v firefox-esr &>/dev/null; then
+        log_success "Firefox is already installed"
+        return
+    fi
+    
+    local os=$(detect_os)
+    
+    if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
+        apt-get install -y -qq firefox-esr || die "Failed to install Firefox"
+    else
+        die "Unsupported OS for Firefox installation"
+    fi
+    
+    log_success "Firefox installed successfully"
+}
+
+setup_tunnel_systemd() {
+    log_info "Setting up persistent SSH tunnel service..."
+    
+    # Create tunnel user and directory
+    if ! id "$TUNNEL_USER" &>/dev/null; then
+        useradd -r -m -d "$TUNNEL_DIR" -s /bin/bash "$TUNNEL_USER"
+    fi
+    
+    mkdir -p "$TUNNEL_DIR"
+    chown -R "$TUNNEL_USER":"$TUNNEL_USER" "$TUNNEL_DIR"
+    
+    # Generate SSH key for tunnel
+    local ssh_key="$TUNNEL_DIR/.ssh/id_rsa"
+    if [[ ! -f "$ssh_key" ]]; then
+        mkdir -p "$TUNNEL_DIR/.ssh"
+        ssh-keygen -t rsa -b 4096 -f "$ssh_key" -N "" -q
+        chown -R "$TUNNEL_USER":"$TUNNEL_USER" "$TUNNEL_DIR/.ssh"
+        chmod 700 "$TUNNEL_DIR/.ssh"
+        chmod 600 "$ssh_key"
+    fi
+    
+    # Create systemd service for persistent tunnel
+    cat > /etc/systemd/system/zforge-tunnel.service << EOF
+[Unit]
+Description=ZynexForge XRDP Tunnel Service
+After=network.target xrdp.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=$TUNNEL_USER
+WorkingDirectory=$TUNNEL_DIR
+ExecStart=/usr/bin/ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -N -T -R *:3389:127.0.0.1:3389 $RELAY_SERVER -p $RELAY_PORT
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    # Create script to check tunnel status
+    cat > /usr/local/bin/check-tunnel << 'EOF'
+#!/bin/bash
+if systemctl is-active --quiet zforge-tunnel.service; then
+    echo "Tunnel is running"
+    ss -tnp | grep ":3389" || echo "No active tunnel connection"
+else
+    echo "Tunnel is not running"
+    exit 1
+fi
+EOF
+    chmod +x /usr/local/bin/check-tunnel
+    
+    systemctl daemon-reload
+    systemctl enable zforge-tunnel.service
+    systemctl restart zforge-tunnel.service
+    
+    # Wait for tunnel to establish
+    log_info "Waiting for tunnel connection..."
+    local max_attempts=30
+    local attempt=0
+    
+    while [[ $attempt -lt $max_attempts ]]; do
+        if systemctl is-active --quiet zforge-tunnel.service && \
+           ss -tnp 2>/dev/null | grep -q "ESTAB.*$RELAY_SERVER"; then
+            log_success "Tunnel established successfully"
             return
         fi
-        
-        ((attempts++))
+        sleep 2
+        ((attempt++))
     done
     
-    die "Could not find free port after $max_attempts attempts"
+    log_warn "Tunnel may still be establishing in background"
+    log_info "Check status with: systemctl status zforge-tunnel.service"
 }
 
-setup_port_forwarding() {
-    local external_port="$1"
+get_relay_public_ip() {
+    log_info "Retrieving relay server public IP..."
     
-    log_info "Setting up port forwarding: $external_port → $XRDP_LOCAL_IP:$XRDP_LOCAL_PORT"
+    # Try multiple methods to get relay IP
+    local relay_ip=""
     
-    # Check if iptables supports nft backend
-    if iptables --version 2>&1 | grep -q nf_tables; then
-        # nftables backend
-        if ! nft list ruleset 2>/dev/null | grep -q "tcp dport $external_port"; then
-            nft add table ip nat 2>/dev/null || true
-            nft add chain ip nat prerouting { type nat hook prerouting priority -100 \; } 2>/dev/null || true
-            nft add rule ip nat prerouting tcp dport $external_port dnat to $XRDP_LOCAL_IP:$XRDP_LOCAL_PORT
-        fi
-    else
-        # legacy iptables
-        iptables -t nat -C PREROUTING -p tcp --dport "$external_port" -j DNAT --to-destination "$XRDP_LOCAL_IP:$XRDP_LOCAL_PORT" 2>/dev/null || \
-        iptables -t nat -A PREROUTING -p tcp --dport "$external_port" -j DNAT --to-destination "$XRDP_LOCAL_IP:$XRDP_LOCAL_PORT"
+    # Method 1: SSH connection test
+    if command -v ssh &>/dev/null; then
+        relay_ip=$(ssh -p "$RELAY_PORT" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+            "$RELAY_SERVER" "curl -s https://api.ipify.org || echo 'RELAY_SERVER'" 2>/dev/null)
     fi
     
-    # Allow the port in firewall
-    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
-        ufw allow "$external_port/tcp" || log_warn "UFW rule addition failed"
-    else
-        iptables -C INPUT -p tcp --dport "$external_port" -j ACCEPT 2>/dev/null || \
-        iptables -A INPUT -p tcp --dport "$external_port" -j ACCEPT
+    # Method 2: Direct DNS resolution
+    if [[ -z "$relay_ip" || "$relay_ip" == "RELAY_SERVER" ]]; then
+        relay_ip=$(dig +short "$RELAY_SERVER" 2>/dev/null | head -1)
     fi
     
-    # Save iptables rules if available
-    if command -v iptables-save &>/dev/null; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    # Method 3: Use relay server domain as fallback
+    if [[ -z "$relay_ip" ]]; then
+        relay_ip="$RELAY_SERVER"
+        log_warn "Using relay server domain name instead of IP"
     fi
     
-    log_success "Port forwarding configured"
+    echo "$relay_ip"
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -211,7 +341,7 @@ setup_port_forwarding() {
 main() {
     # Display banner
     echo -e "\033[1;36m$BANNER\033[0m"
-    echo -e "\033[1;36m  ZynexForge: zforge-rdp - Production RDP Automation\033[0m"
+    echo -e "\033[1;36m  ZynexForge: zforge-xrdp - Secure XRDP with Relay Tunnel\033[0m"
     echo -e "\033[1;36m$BANNER\033[0m"
     
     # Validate environment
@@ -219,14 +349,14 @@ main() {
     check_dependencies
     
     # Execute flow
-    local public_ip=$(get_public_ip)
     local username=$(generate_random_username)
     local password=$(generate_strong_password)
-    local external_port=$(find_free_port)
     
     create_linux_user "$username" "$password"
+    install_firefox
     install_xrdp
-    setup_port_forwarding "$external_port"
+    setup_tunnel_systemd
+    local relay_ip=$(get_relay_public_ip)
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # FINAL OUTPUT
@@ -234,18 +364,18 @@ main() {
     echo -e "\n"
     echo -e "\033[1;32m🎉 Congratulations! Your RDP has been created\033[0m"
     echo -e ""
-    echo -e "\033[1;37mIP     : \033[1;33m$public_ip:$external_port\033[0m"
+    echo -e "\033[1;37mIP     : \033[1;33m$relay_ip:3389\033[0m"
     echo -e "\033[1;37mUSER   : \033[1;33m$username\033[0m"
     echo -e "\033[1;37mPASS   : \033[1;33m$password\033[0m"
     echo -e ""
     echo -e "\033[1;36m$BANNER\033[0m"
     
-    # Important notes
-    echo -e "\033[1;33m⚠️  IMPORTANT:\033[0m"
-    echo -e "  1. Connect using Microsoft Remote Desktop or compatible RDP client"
-    echo -e "  2. XRDP is bound to localhost only, accessible via port forwarding"
-    echo -e "  3. Password is stored securely in system auth database"
-    echo -e "  4. Use 'sudo passwd $username' to change password"
+    # Connection information
+    echo -e "\033[1;33m📋 Connection Details:\033[0m"
+    echo -e "  • Connect using Microsoft Remote Desktop or any RDP client"
+    echo -e "  • Firefox is pre-installed and ready to use"
+    echo -e "  • Session will start with XFCE desktop environment"
+    echo -e "  • No public IP required on your VPS"
     echo -e "\033[1;36m$BANNER\033[0m"
 }
 
