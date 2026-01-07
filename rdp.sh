@@ -2,7 +2,7 @@
 # ============================================================================
 # ZynexForge: zforge-xrdp
 # Production-Grade XRDP Automation with Relay Tunnel
-# Version: 2.1.0
+# Version: 2.2.0
 # ============================================================================
 
 set -euo pipefail
@@ -21,7 +21,7 @@ readonly TUNNEL_USER="zforge_tunnel"
 readonly TUNNEL_DIR="/opt/zforge-tunnel"
 
 # Required commands
-readonly REQUIRED_CMDS=("ssh" "systemctl" "curl" "wget" "openssl" "useradd" "chpasswd")
+readonly REQUIRED_CMDS=("ssh" "systemctl" "curl" "openssl" "useradd" "chpasswd")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # LOGGING & UTILITIES
@@ -98,14 +98,13 @@ create_linux_user() {
     useradd -m -s /bin/bash -G sudo "$username" || die "Failed to create user"
     echo "$username:$password" | chpasswd || die "Failed to set password"
     
-    # Set up basic X environment
+    # Set up XFCE environment
     mkdir -p /home/"$username"/.config
     cat > /home/"$username"/.xsession << 'EOF'
 #!/bin/bash
-export GNOME_SHELL_SESSION_MODE=ubuntu
-export XDG_CURRENT_DESKTOP=ubuntu:GNOME
-export XDG_CONFIG_DIRS=/etc/xdg/xdg-ubuntu:/etc/xdg
-export XDG_DATA_DIRS=/usr/share/ubuntu:/usr/local/share:/usr/share:/var/lib/snapd/desktop
+export XDG_CURRENT_DESKTOP=XFCE
+export XDG_CONFIG_DIRS=/etc/xdg/xdg-xfce:/etc/xdg
+export XDG_DATA_DIRS=/usr/share/xfce4:/usr/local/share:/usr/share
 exec startxfce4
 EOF
     chmod +x /home/"$username"/.xsession
@@ -134,7 +133,6 @@ install_xrdp() {
             xfce4 \
             xfce4-goodies \
             xfce4-terminal \
-            firefox \
             || die "Failed to install XRDP packages"
             
         # Additional XFCE components for better experience
@@ -226,45 +224,6 @@ EOF
     systemctl restart xrdp || die "Failed to start XRDP service"
     
     log_success "XRDP installed and configured securely"
-}
-
-install_firefox() {
-    log_info "Installing Firefox browser..."
-    
-    # Check if Firefox is already installed
-    if command -v firefox &>/dev/null; then
-        log_success "Firefox is already installed"
-        return
-    fi
-    
-    local os=$(detect_os)
-    
-    if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
-        # Try multiple Firefox package names
-        if apt-get install -y -qq firefox 2>/dev/null; then
-            log_success "Firefox installed successfully"
-            return
-        fi
-        
-        # If firefox package not available, try firefox-esr
-        if apt-get install -y -qq firefox-esr 2>/dev/null; then
-            log_success "Firefox ESR installed successfully"
-            return
-        fi
-        
-        # Last resort: install from snap
-        log_warn "Installing Firefox via snap..."
-        if command -v snap &>/dev/null; then
-            snap install firefox || log_warn "Snap installation failed"
-        else
-            apt-get install -y -qq snapd
-            snap install firefox || die "Failed to install Firefox via snap"
-        fi
-    else
-        die "Unsupported OS for Firefox installation"
-    fi
-    
-    log_success "Firefox installed successfully"
 }
 
 setup_tunnel_systemd() {
@@ -388,8 +347,7 @@ main() {
     local password=$(generate_strong_password)
     
     create_linux_user "$username" "$password"
-    install_xrdp  # This now includes Firefox installation
-    install_firefox  # Extra safety to ensure Firefox is installed
+    install_xrdp
     setup_tunnel_systemd
     local relay_ip=$(get_relay_public_ip)
     
