@@ -2,7 +2,7 @@
 # ============================================================================
 # ZynexForge: zforge-xrdp
 # Production-Grade XRDP Automation with Relay Tunnel
-# Version: 2.2.0
+# Version: 2.3.0
 # ============================================================================
 
 set -euo pipefail
@@ -301,19 +301,35 @@ get_relay_public_ip() {
     # Try multiple methods to get relay IP
     local relay_ip=""
     
-    # Method 1: Direct DNS resolution
+    # Method 1: Try to resolve domain
     if command -v dig &>/dev/null; then
-        relay_ip=$(dig +short "$RELAY_SERVER" 2>/dev/null | head -1)
-    elif command -v nslookup &>/dev/null; then
-        relay_ip=$(nslookup "$RELAY_SERVER" 2>/dev/null | grep -oP 'Address: \K[0-9.]+' | head -1)
+        relay_ip=$(dig +short "$RELAY_SERVER" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
     fi
     
-    # Method 2: Use host command
-    if [[ -z "$relay_ip" ]] && command -v host &>/dev/null; then
-        relay_ip=$(host "$RELAY_SERVER" 2>/dev/null | grep -oP 'has address \K[0-9.]+' | head -1)
+    # Method 2: Try nslookup
+    if [[ -z "$relay_ip" ]] && command -v nslookup &>/dev/null; then
+        relay_ip=$(nslookup "$RELAY_SERVER" 2>/dev/null | grep -E 'Address: [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | head -1)
     fi
     
-    # Method 3: Use relay server domain as fallback
+    # Method 3: Try getent
+    if [[ -z "$relay_ip" ]] && command -v getent &>/dev/null; then
+        relay_ip=$(getent ahosts "$RELAY_SERVER" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $1}' | head -1)
+    fi
+    
+    # Method 4: Try ping (just for resolution)
+    if [[ -z "$relay_ip" ]] && command -v ping &>/dev/null; then
+        relay_ip=$(ping -c 1 -W 1 "$RELAY_SERVER" 2>/dev/null | grep -E 'PING [a-zA-Z0-9.-]+ \([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)' | sed -E 's/.*\(([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\).*/\1/')
+    fi
+    
+    # Method 5: Use curl to external service if domain doesn't resolve
+    if [[ -z "$relay_ip" ]]; then
+        relay_ip=$(curl -s --max-time 5 "https://api.ipify.org" 2>/dev/null || echo "")
+        if [[ -n "$relay_ip" ]]; then
+            log_warn "Could not resolve relay domain, using detected public IP: $relay_ip"
+        fi
+    fi
+    
+    # Final fallback
     if [[ -z "$relay_ip" ]]; then
         relay_ip="$RELAY_SERVER"
         log_warn "Using relay server domain name: $RELAY_SERVER"
