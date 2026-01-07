@@ -2,6 +2,174 @@
 # ============================================================================
 # ZynexForge: zforge-xrdp
 # Production-Grade XRDP Automation with Relay Tunnel
+# Version: 2.5.0
+# ============================================================================
+
+set -euo pipefail
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONFIGURATION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+readonly USER_PREFIX="zforge"
+readonly XRDP_LOCAL_PORT=3389
+readonly XRDP_LOCAL_IP="127.0.0.1"
+readonly RELAY_SERVER="relay.zynexforge.net"
+readonly RELAY_PORT=2222
+readonly TUNNEL_USER="zforge_tunnel"
+readonly TUNNEL_DIR="/opt/zforge-tunnel"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# UTILITIES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+die() { echo "Error: $1" >&2; exit 1; }
+validate_root() { [[ $EUID -eq 0 ]] || die "Must be run as root"; }
+
+check_dependencies() {
+    for cmd in ssh systemctl curl openssl useradd chpasswd; do
+        command -v "$cmd" &>/dev/null || die "Missing: $cmd"
+    done
+}
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CORE FUNCTIONS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+generate_random_username() {
+    echo "${USER_PREFIX}_$(openssl rand -hex 3)"
+}
+
+generate_strong_password() {
+    openssl rand -base64 24 | tr -d '/+=\n'
+}
+
+create_linux_user() {
+    local username="$1" password="$2"
+    
+    if ! id "$username" &>/dev/null; then
+        useradd -m -s /bin/bash -G sudo "$username" || die "Failed to create user"
+        mkdir -p /home/"$username"/.config
+        cat > /home/"$username"/.xsession << 'EOF'
+#!/bin/bash
+export XDG_CURRENT_DESKTOP=XFCE
+exec startxfce4
+EOF
+        chmod +x /home/"$username"/.xsession
+        chown -R "$username":"$username" /home/"$username"
+    fi
+    echo "$username:$password" | chpasswd || die "Failed to set password"
+}
+
+install_xrdp() {
+    if ! systemctl is-active --quiet xrdp; then
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-goodies xfce4-terminal || die "Failed to install XRDP"
+        
+        cat > /etc/xrdp/xrdp.ini << 'EOF'
+[globals]
+port=3389
+crypt_level=high
+ip=127.0.0.1
+
+[xrdp1]
+name=sesman-Xvnc
+lib=libvnc.so
+username=ask
+password=ask
+ip=127.0.0.1
+port=-1
+EOF
+        
+        echo "xfce4-session" > /etc/xrdp/startwm.sh
+        chmod +x /etc/xrdp/startwm.sh
+        systemctl enable xrdp
+        systemctl restart xrdp
+    fi
+}
+
+setup_tunnel_systemd() {
+    if ! id "$TUNNEL_USER" &>/dev/null; then
+        useradd -r -m -d "$TUNNEL_DIR" -s /bin/bash "$TUNNEL_USER"
+    fi
+    
+    mkdir -p "$TUNNEL_DIR/.ssh"
+    chown -R "$TUNNEL_USER":"$TUNNEL_USER" "$TUNNEL_DIR"
+    
+    if [[ ! -f "$TUNNEL_DIR/.ssh/id_rsa" ]]; then
+        ssh-keygen -t rsa -b 4096 -f "$TUNNEL_DIR/.ssh/id_rsa" -N "" -q
+        chmod 700 "$TUNNEL_DIR/.ssh"
+        chmod 600 "$TUNNEL_DIR/.ssh/id_rsa"
+    fi
+    
+    cat > /etc/systemd/system/zforge-tunnel.service << EOF
+[Unit]
+Description=ZynexForge XRDP Tunnel
+After=network.target
+
+[Service]
+Type=simple
+User=$TUNNEL_USER
+ExecStart=/usr/bin/ssh -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -N -T -R *:3389:127.0.0.1:3389 $RELAY_SERVER -p $RELAY_PORT
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable zforge-tunnel.service
+    systemctl restart zforge-tunnel.service
+    
+    # Wait for tunnel
+    for i in {1..10}; do
+        pgrep -f "ssh.*$RELAY_SERVER.*3389" &>/dev/null && break
+        sleep 2
+    done
+}
+
+get_relay_public_ip() {
+    local relay_ip=""
+    
+    for cmd in "getent ahosts" "host" "ping -c 1 -W 1" "nslookup"; do
+        relay_ip=$(eval "$cmd $RELAY_SERVER 2>/dev/null" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        [[ -n "$relay_ip" ]] && break
+    done
+    
+    [[ -z "$relay_ip" ]] && relay_ip="$RELAY_SERVER"
+    echo "$relay_ip"
+}
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MAIN EXECUTION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+main() {
+    validate_root
+    check_dependencies
+    
+    # Update silently
+    apt-get update -qq &>/dev/null || true
+    
+    local username=$(generate_random_username)
+    local password=$(generate_strong_password)
+    
+    create_linux_user "$username" "$password"
+    install_xrdp
+    setup_tunnel_systemd
+    local relay_ip=$(get_relay_public_ip)
+    
+    # FINAL OUTPUT
+    echo -e "\n\033[1;32m🎉 Congratulations! Your RDP has been created\033[0m\n"
+    echo -e "\033[1;37mIP     : \033[1;33m$relay_ip:3389\033[0m"
+    echo -e "\033[1;37mUSER   : \033[1;33m$username\033[0m"
+    echo -e "\033[1;37mPASS   : \033[1;33m$password\033[0m\n"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main
+fi#!/bin/bash
+# ============================================================================
+# ZynexForge: zforge-xrdp
+# Production-Grade XRDP Automation with Relay Tunnel
 # Version: 2.4.0
 # ============================================================================
 
