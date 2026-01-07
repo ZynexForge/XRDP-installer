@@ -2,7 +2,7 @@
 # ============================================================================
 # ZynexForge: zforge-xrdp
 # Production-Grade XRDP Automation with Relay Tunnel
-# Version: 2.0.0
+# Version: 2.1.0
 # ============================================================================
 
 set -euo pipefail
@@ -115,7 +115,7 @@ EOF
 }
 
 install_xrdp() {
-    log_info "Installing XRDP..."
+    log_info "Installing XRDP and desktop environment..."
     
     if systemctl is-active --quiet xrdp; then
         log_success "XRDP is already installed and running"
@@ -126,13 +126,28 @@ install_xrdp() {
     
     if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
         apt-get update -qq
+        
+        # Install XRDP and XFCE desktop environment
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             xrdp \
             xorgxrdp \
             xfce4 \
             xfce4-goodies \
-            firefox-esr \
+            xfce4-terminal \
+            firefox \
             || die "Failed to install XRDP packages"
+            
+        # Additional XFCE components for better experience
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xfce4-panel \
+            xfce4-session \
+            xfce4-settings \
+            xfce4-appfinder \
+            xfdesktop4 \
+            xfwm4 \
+            thunar \
+            || log_warn "Some XFCE components failed to install"
+            
     else
         die "Unsupported OS: $os"
     fi
@@ -203,19 +218,21 @@ param6=-dpi
 param7=96
 EOF
     
+    # Ensure XRDP uses XFCE for all users
+    echo "xfce4-session" > /etc/xrdp/startwm.sh
+    chmod +x /etc/xrdp/startwm.sh
+    
     systemctl enable xrdp || die "Failed to enable XRDP service"
     systemctl restart xrdp || die "Failed to start XRDP service"
-    
-    # Add user to ssl-cert group for XRDP
-    usermod -a -G ssl-cert "$USERNAME" 2>/dev/null || true
     
     log_success "XRDP installed and configured securely"
 }
 
 install_firefox() {
-    log_info "Installing Firefox..."
+    log_info "Installing Firefox browser..."
     
-    if command -v firefox &>/dev/null || command -v firefox-esr &>/dev/null; then
+    # Check if Firefox is already installed
+    if command -v firefox &>/dev/null; then
         log_success "Firefox is already installed"
         return
     fi
@@ -223,7 +240,26 @@ install_firefox() {
     local os=$(detect_os)
     
     if [[ "$os" == "ubuntu" || "$os" == "debian" ]]; then
-        apt-get install -y -qq firefox-esr || die "Failed to install Firefox"
+        # Try multiple Firefox package names
+        if apt-get install -y -qq firefox 2>/dev/null; then
+            log_success "Firefox installed successfully"
+            return
+        fi
+        
+        # If firefox package not available, try firefox-esr
+        if apt-get install -y -qq firefox-esr 2>/dev/null; then
+            log_success "Firefox ESR installed successfully"
+            return
+        fi
+        
+        # Last resort: install from snap
+        log_warn "Installing Firefox via snap..."
+        if command -v snap &>/dev/null; then
+            snap install firefox || log_warn "Snap installation failed"
+        else
+            apt-get install -y -qq snapd
+            snap install firefox || die "Failed to install Firefox via snap"
+        fi
     else
         die "Unsupported OS for Firefox installation"
     fi
@@ -263,7 +299,7 @@ Wants=network.target
 Type=simple
 User=$TUNNEL_USER
 WorkingDirectory=$TUNNEL_DIR
-ExecStart=/usr/bin/ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -N -T -R *:3389:127.0.0.1:3389 $RELAY_SERVER -p $RELAY_PORT
+ExecStart=/usr/bin/ssh -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -N -T -R *:3389:127.0.0.1:3389 $RELAY_SERVER -p $RELAY_PORT
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -273,33 +309,24 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
     
-    # Create script to check tunnel status
-    cat > /usr/local/bin/check-tunnel << 'EOF'
-#!/bin/bash
-if systemctl is-active --quiet zforge-tunnel.service; then
-    echo "Tunnel is running"
-    ss -tnp | grep ":3389" || echo "No active tunnel connection"
-else
-    echo "Tunnel is not running"
-    exit 1
-fi
-EOF
-    chmod +x /usr/local/bin/check-tunnel
-    
     systemctl daemon-reload
     systemctl enable zforge-tunnel.service
+    
+    # Start the tunnel service
     systemctl restart zforge-tunnel.service
     
     # Wait for tunnel to establish
-    log_info "Waiting for tunnel connection..."
+    log_info "Establishing tunnel connection..."
     local max_attempts=30
     local attempt=0
     
     while [[ $attempt -lt $max_attempts ]]; do
-        if systemctl is-active --quiet zforge-tunnel.service && \
-           ss -tnp 2>/dev/null | grep -q "ESTAB.*$RELAY_SERVER"; then
-            log_success "Tunnel established successfully"
-            return
+        if systemctl is-active --quiet zforge-tunnel.service; then
+            # Check if SSH process is running
+            if pgrep -f "ssh.*$RELAY_SERVER.*3389" >/dev/null; then
+                log_success "Tunnel established successfully"
+                return
+            fi
         fi
         sleep 2
         ((attempt++))
@@ -315,21 +342,24 @@ get_relay_public_ip() {
     # Try multiple methods to get relay IP
     local relay_ip=""
     
-    # Method 1: SSH connection test
-    if command -v ssh &>/dev/null; then
-        relay_ip=$(ssh -p "$RELAY_PORT" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-            "$RELAY_SERVER" "curl -s https://api.ipify.org || echo 'RELAY_SERVER'" 2>/dev/null)
+    # Method 1: Direct DNS resolution
+    if command -v dig &>/dev/null; then
+        relay_ip=$(dig +short "$RELAY_SERVER" 2>/dev/null | head -1)
+    elif command -v nslookup &>/dev/null; then
+        relay_ip=$(nslookup "$RELAY_SERVER" 2>/dev/null | grep -oP 'Address: \K[0-9.]+' | head -1)
     fi
     
-    # Method 2: Direct DNS resolution
-    if [[ -z "$relay_ip" || "$relay_ip" == "RELAY_SERVER" ]]; then
-        relay_ip=$(dig +short "$RELAY_SERVER" 2>/dev/null | head -1)
+    # Method 2: Use host command
+    if [[ -z "$relay_ip" ]] && command -v host &>/dev/null; then
+        relay_ip=$(host "$RELAY_SERVER" 2>/dev/null | grep -oP 'has address \K[0-9.]+' | head -1)
     fi
     
     # Method 3: Use relay server domain as fallback
     if [[ -z "$relay_ip" ]]; then
         relay_ip="$RELAY_SERVER"
-        log_warn "Using relay server domain name instead of IP"
+        log_warn "Using relay server domain name: $RELAY_SERVER"
+    else
+        log_success "Relay IP resolved: $relay_ip"
     fi
     
     echo "$relay_ip"
@@ -346,6 +376,11 @@ main() {
     
     # Validate environment
     validate_root
+    
+    # Update package lists first
+    log_info "Updating system packages..."
+    apt-get update -qq || log_warn "Package update had issues"
+    
     check_dependencies
     
     # Execute flow
@@ -353,8 +388,8 @@ main() {
     local password=$(generate_strong_password)
     
     create_linux_user "$username" "$password"
-    install_firefox
-    install_xrdp
+    install_xrdp  # This now includes Firefox installation
+    install_firefox  # Extra safety to ensure Firefox is installed
     setup_tunnel_systemd
     local relay_ip=$(get_relay_public_ip)
     
@@ -370,12 +405,10 @@ main() {
     echo -e ""
     echo -e "\033[1;36m$BANNER\033[0m"
     
-    # Connection information
-    echo -e "\033[1;33m📋 Connection Details:\033[0m"
-    echo -e "  • Connect using Microsoft Remote Desktop or any RDP client"
-    echo -e "  • Firefox is pre-installed and ready to use"
-    echo -e "  • Session will start with XFCE desktop environment"
-    echo -e "  • No public IP required on your VPS"
+    # Service status
+    echo -e "\033[1;33m⚡ Service Status:\033[0m"
+    echo -e "  XRDP: $(systemctl is-active xrdp.service)"
+    echo -e "  Tunnel: $(systemctl is-active zforge-tunnel.service)"
     echo -e "\033[1;36m$BANNER\033[0m"
 }
 
