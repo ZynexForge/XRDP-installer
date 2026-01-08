@@ -3,7 +3,7 @@
 # ============================================================================
 # ZynexForge: zforge-rdp
 # Production XRDP Tunnel Setup
-# Version: 18.0.0
+# Version: 19.0.0
 # ============================================================================
 
 set -e
@@ -13,11 +13,10 @@ RELAY_SERVER=$(curl -s https://api.ipify.org || echo "your-vps-public-ip")
 RELAY_PORT="7000"
 FRP_TOKEN="zynexforge_global_token_2024"
 FRP_VERSION="0.54.0"
-MIN_PORT=40000
-MAX_PORT=60000
 USER_PREFIX="zforge"
 LOCAL_RDP_PORT="3389"
 LOCAL_IP="127.0.0.1"
+EXTERNAL_PORT="3389"
 
 # Banner
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -104,11 +103,8 @@ cp frpc /opt/zynexforge/
 chmod +x /opt/zynexforge/frpc
 cd / && rm -rf /tmp/frp*
 
-# Generate random port
-RANDOM_PORT=$((MIN_PORT + RANDOM % 1000))
-
 echo "Relay Server: $RELAY_SERVER"
-echo "External Port: $RANDOM_PORT"
+echo "External Port: $EXTERNAL_PORT"
 
 # Create FRP config
 cat > /etc/zynexforge.ini << EOF
@@ -121,7 +117,7 @@ token = ${FRP_TOKEN}
 type = tcp
 local_ip = ${LOCAL_IP}
 local_port = ${LOCAL_RDP_PORT}
-remote_port = ${RANDOM_PORT}
+remote_port = ${EXTERNAL_PORT}
 EOF
 
 # Create service
@@ -155,7 +151,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "🎉 Congratulations! Your RDP has been created"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo "IP     : ${RELAY_SERVER}:${RANDOM_PORT}"
+echo "IP     : ${RELAY_SERVER}:${EXTERNAL_PORT}"
 echo "USER   : ${USERNAME}"
 echo "PASS   : ${PASSWORD}"
 echo ""
@@ -164,7 +160,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo "How to connect:"
 echo "1. Remote Desktop Connection"
-echo "2. Enter: ${RELAY_SERVER}:${RANDOM_PORT}"
+echo "2. Enter: ${RELAY_SERVER}:${EXTERNAL_PORT}"
 echo "3. Username: ${USERNAME}"
 echo "4. Password: ${PASSWORD}"
 
@@ -176,7 +172,7 @@ echo "Tunnel: $(systemctl is-active zynexforge.service 2>/dev/null || echo 'unkn
 # Save credentials
 mkdir -p /root/.zynexforge
 cat > /root/.zynexforge/credentials.txt << EOF
-IP: ${RELAY_SERVER}:${RANDOM_PORT}
+IP: ${RELAY_SERVER}:${EXTERNAL_PORT}
 User: ${USERNAME}
 Pass: ${PASSWORD}
 Date: $(date)
