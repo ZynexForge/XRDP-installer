@@ -1,46 +1,45 @@
 #!/bin/bash
+
 # ============================================================================
 # ZynexForge: zforge-xrdp
 # Production-Grade XRDP Automation with Relay Tunnel
-# Version: 2.6.0
+# Version: 2.7.0
 # ============================================================================
 
-set -euo pipefail
+set -e
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CONFIGURATION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-readonly USER_PREFIX="zforge"
-readonly XRDP_LOCAL_PORT=3389
-readonly XRDP_LOCAL_IP="127.0.0.1"
-readonly RELAY_SERVER="relay.zynexforge.net"
-readonly RELAY_PORT=2222
-readonly TUNNEL_USER="zforge_tunnel"
-readonly TUNNEL_DIR="/opt/zforge-tunnel"
+# Configuration
+USER_PREFIX="zforge"
+XRDP_LOCAL_PORT=3389
+XRDP_LOCAL_IP="127.0.0.1"
+RELAY_SERVER="relay.zynexforge.net"
+RELAY_PORT=2222
+TUNNEL_USER="zforge_tunnel"
+TUNNEL_DIR="/opt/zforge-tunnel"
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# UTILITIES
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Utilities
 die() {
     echo "Error: $1" >&2
     exit 1
 }
 
 validate_root() {
-    [ "$EUID" -eq 0 ] || die "Must be run as root"
+    if [ "$EUID" -ne 0 ]; then
+        die "Must be run as root"
+    fi
 }
 
 check_dependencies() {
     for cmd in ssh systemctl curl openssl useradd chpasswd; do
-        command -v "$cmd" >/dev/null 2>&1 || die "Missing: $cmd"
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            die "Missing: $cmd"
+        fi
     done
 }
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CORE FUNCTIONS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Core functions
 generate_random_username() {
-    echo "${USER_PREFIX}_$(openssl rand -hex 3 2>/dev/null || echo "$(date +%s)")"
+    echo "${USER_PREFIX}_$(openssl rand -hex 3 2>/dev/null || date +%s)"
 }
 
 generate_strong_password() {
@@ -127,7 +126,7 @@ EOF
     systemctl restart zforge-tunnel.service >/dev/null 2>&1
     
     # Wait for tunnel
-    for i in $(seq 1 10); do
+    for i in 1 2 3 4 5 6 7 8 9 10; do
         if pgrep -f "ssh.*$RELAY_SERVER.*3389" >/dev/null 2>&1; then
             break
         fi
@@ -155,13 +154,14 @@ get_relay_public_ip() {
         relay_ip=$(nslookup "$RELAY_SERVER" 2>/dev/null | grep Address | tail -1 | awk '{print $2}')
     fi
     
-    [ -z "$relay_ip" ] && relay_ip="$RELAY_SERVER"
+    if [ -z "$relay_ip" ]; then
+        relay_ip="$RELAY_SERVER"
+    fi
+    
     echo "$relay_ip"
 }
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MAIN EXECUTION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Main execution
 main() {
     validate_root
     check_dependencies
@@ -189,6 +189,10 @@ main() {
 }
 
 # Entry point
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+if [ "$(basename "$0")" != "bash" ] && [ -n "$BASH_SOURCE" ]; then
+    main
+elif [ "$0" = "bash" ]; then
+    main
+else
     main
 fi
