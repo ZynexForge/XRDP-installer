@@ -2,8 +2,8 @@
 
 # ============================================================================
 # ZynexForge: zforge-xrdp
-# RDP Setup with Auto-Tunnel
-# Version: 7.0.0
+# RDP Setup - Robust Edition
+# Version: 8.0.0
 # ============================================================================
 
 set -e
@@ -18,7 +18,6 @@ NC='\033[0m'
 # Configuration
 USER_PREFIX="zforge"
 XRDP_PORT=3389
-LOCALHOST="127.0.0.1"
 
 # Banner
 echo -e "${BLUE}"
@@ -33,35 +32,29 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Check if we have public IP
-check_public_ip() {
-    local ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
-    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ $ip != "127."* ]] && [[ $ip != "10."* ]] && [[ $ip != "192.168."* ]] && [[ $ip != "172."* ]]; then
-        echo "$ip"
-        return 0
-    fi
-    echo ""
-    return 1
-}
-
 # Install dependencies
-echo -e "${BLUE}[1/5] Installing dependencies...${NC}"
+echo -e "${BLUE}[1/6] Installing dependencies...${NC}"
 apt-get update >/dev/null 2>&1
 apt-get install -y xrdp xorgxrdp xfce4 xfce4-goodies xfce4-terminal curl openssl >/dev/null 2>&1
 echo -e "${GREEN}✓ Dependencies installed${NC}"
 
-# Configure XRDP
-echo -e "${BLUE}[2/5] Configuring XRDP...${NC}"
+# Clean up XRDP
+echo -e "${BLUE}[2/6] Cleaning up XRDP...${NC}"
 systemctl stop xrdp >/dev/null 2>&1 || true
+pkill -9 xrdp >/dev/null 2>&1 || true
+pkill -9 xrdp-sesman >/dev/null 2>&1 || true
 
-# Create XRDP config - bind to localhost only for security
+# Backup old config
+cp /etc/xrdp/xrdp.ini /etc/xrdp/xrdp.ini.backup 2>/dev/null || true
+
+# Configure XRDP - Simple configuration
+echo -e "${BLUE}[3/6] Configuring XRDP...${NC}"
 cat > /etc/xrdp/xrdp.ini << 'EOF'
 [globals]
 bitmap_cache=yes
-bitmap_compression=yes
 port=3389
 crypt_level=high
-max_bpp=32
+max_bpp=24
 
 [xrdp1]
 name=sesman-Xvnc
@@ -72,21 +65,37 @@ ip=127.0.0.1
 port=-1
 EOF
 
-echo "xfce4-session" > /etc/xrdp/startwm.sh
+# Fix permissions
+chmod 644 /etc/xrdp/xrdp.ini
+
+# Set XFCE as default
+echo "#!/bin/bash" > /etc/xrdp/startwm.sh
+echo "xfce4-session" >> /etc/xrdp/startwm.sh
 chmod +x /etc/xrdp/startwm.sh
 
+# Start XRDP
+echo -e "${BLUE}[4/6] Starting XRDP service...${NC}"
+systemctl daemon-reload >/dev/null 2>&1
 systemctl enable xrdp >/dev/null 2>&1
-systemctl start xrdp
 
+# Start with retry
+for i in {1..3}; do
+    systemctl start xrdp 2>/dev/null && break
+    sleep 2
+done
+
+# Check if running
 if systemctl is-active --quiet xrdp; then
-    echo -e "${GREEN}✓ XRDP configured (localhost only)${NC}"
+    echo -e "${GREEN}✓ XRDP service started${NC}"
 else
-    echo -e "${RED}✗ XRDP failed to start${NC}"
-    exit 1
+    echo -e "${YELLOW}⚠ XRDP service may have issues, checking port...${NC}"
+    # Try direct start
+    xrdp 2>/dev/null &
+    sleep 3
 fi
 
 # Create user
-echo -e "${BLUE}[3/5] Creating user account...${NC}"
+echo -e "${BLUE}[5/6] Creating user account...${NC}"
 USERNAME="${USER_PREFIX}_$(openssl rand -hex 3 2>/dev/null || echo "user")"
 PASSWORD=$(openssl rand -base64 12 2>/dev/null | tr -d '/+=\n' | head -c 12)
 if [ -z "$PASSWORD" ]; then
@@ -108,63 +117,47 @@ EOF
 fi
 echo -e "${GREEN}✓ User $USERNAME created${NC}"
 
-# Check network and provide connection options
-echo -e "${BLUE}[4/5] Analyzing network...${NC}"
+# Check connection info
+echo -e "${BLUE}[6/6] Setting up connection...${NC}"
 
-# Try to detect public IP
-PUBLIC_IP=$(check_public_ip)
+# Try to get IP
+PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
+LOCAL_IP=$(hostname -I | awk '{print $1}' | head -1)
 
-if [ -n "$PUBLIC_IP" ]; then
-    echo -e "${GREEN}✓ Public IP detected: $PUBLIC_IP${NC}"
-    echo -e "${BLUE}[5/5] Setting up direct access...${NC}"
-    
-    # Open firewall if needed
-    if command -v ufw >/dev/null 2>&1; then
-        ufw allow $XRDP_PORT/tcp >/dev/null 2>&1
-        echo -e "${GREEN}✓ Firewall opened port $XRDP_PORT${NC}"
-    fi
-    
+if [ -n "$PUBLIC_IP" ] && [[ $PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     CONNECT_IP="$PUBLIC_IP"
-    ACCESS_MODE="Direct (Public IP)"
-    
+    ACCESS_MODE="Public IP"
+    echo -e "${GREEN}✓ Public IP: $PUBLIC_IP${NC}"
 else
-    echo -e "${YELLOW}⚠ No public IP detected${NC}"
-    echo -e "${BLUE}[5/5] Setting up local access...${NC}"
-    
-    # Get local IP
-    LOCAL_IP=$(hostname -I | awk '{print $1}' | head -1)
-    if [ -z "$LOCAL_IP" ]; then
-        LOCAL_IP="127.0.0.1"
-    fi
-    
     CONNECT_IP="$LOCAL_IP"
-    ACCESS_MODE="Local Network Only"
-    
-    echo -e "${YELLOW}⚠ Access limited to local network${NC}"
-    echo -e "${YELLOW}To access from internet, you need:${NC}"
-    echo -e "${YELLOW}1. Port forwarding on your router${NC}"
-    echo -e "${YELLOW}2. Or use a tunnel/relay service${NC}"
+    ACCESS_MODE="Local Network"
+    echo -e "${YELLOW}⚠ Using local IP: $LOCAL_IP${NC}"
+fi
+
+# Check if XRDP is listening
+sleep 2
+if ss -tln | grep -q ":3389 "; then
+    echo -e "${GREEN}✓ XRDP listening on port 3389${NC}"
+else
+    echo -e "${YELLOW}⚠ XRDP port not detected, trying alternative...${NC}"
+    # Try netstat
+    if netstat -tln 2>/dev/null | grep -q ":3389 "; then
+        echo -e "${GREEN}✓ XRDP found via netstat${NC}"
+    else
+        echo -e "${YELLOW}⚠ XRDP may not be running${NC}"
+    fi
 fi
 
 # Save credentials
 mkdir -p /root/.zforge
 cat > /root/.zforge/rdp_credentials.txt << EOF
-Connection IP: $CONNECT_IP
+IP: $CONNECT_IP
 Port: $XRDP_PORT
 Username: $USERNAME
 Password: $PASSWORD
-Access Mode: $ACCESS_MODE
-Date: $(date)
+Mode: $ACCESS_MODE
 EOF
 chmod 600 /root/.zforge/rdp_credentials.txt
-
-# Test service
-sleep 2
-if ss -tln | grep -q ":3389 "; then
-    echo -e "${GREEN}✓ XRDP service ready${NC}"
-else
-    echo -e "${YELLOW}⚠ XRDP port not detected${NC}"
-fi
 
 # Final output
 echo -e "\n${GREEN}"
@@ -179,7 +172,6 @@ echo -e "IP:       ${GREEN}$CONNECT_IP${NC}"
 echo -e "Port:     ${GREEN}$XRDP_PORT${NC}"
 echo -e "Username: ${GREEN}$USERNAME${NC}"
 echo -e "Password: ${GREEN}$PASSWORD${NC}"
-echo -e "Mode:     ${GREEN}$ACCESS_MODE${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 echo -e "\n${YELLOW}How to connect:${NC}"
@@ -189,24 +181,21 @@ echo "3. Username: ${GREEN}$USERNAME${NC}"
 echo "4. Password: ${GREEN}$PASSWORD${NC}"
 
 echo -e "\n${YELLOW}Service Status:${NC}"
-echo "XRDP:     $(systemctl is-active xrdp)"
-echo "Listening: $(ss -tln | grep -q ':3389 ' && echo 'Yes' || echo 'No')"
+echo "XRDP: $(systemctl is-active xrdp 2>/dev/null || echo 'unknown')"
+echo "Port 3389: $(ss -tln | grep -q ':3389 ' && echo 'Listening' || echo 'Not found')"
 
-if [ "$ACCESS_MODE" = "Local Network Only" ]; then
-    echo -e "\n${RED}⚠ IMPORTANT - LOCAL ACCESS ONLY:${NC}"
-    echo "Your RDP is only accessible from your local network."
+if [ "$ACCESS_MODE" = "Local Network" ]; then
+    echo -e "\n${YELLOW}⚠ Local Access Only:${NC}"
     echo "For internet access:"
     echo "1. Configure port forwarding on router"
-    echo "2. Forward port $XRDP_PORT to $CONNECT_IP"
-    echo "3. Use your router's public IP to connect"
+    echo "2. Forward port 3389 to $LOCAL_IP"
 fi
 
-echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}✓ Setup completed at $(date)${NC}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-# Provide troubleshooting info
 echo -e "\n${YELLOW}Troubleshooting:${NC}"
-echo "Check logs: journalctl -u xrdp -f"
+echo "Check logs: journalctl -u xrdp --no-pager -n 20"
 echo "Restart: systemctl restart xrdp"
-echo "Credentials saved: /root/.zforge/rdp_credentials.txt"
+echo "Direct start: xrdp &"
+
+echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}✓ Setup completed${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
