@@ -2,8 +2,8 @@
 
 # ============================================================================
 # ZynexForge: zforge-xrdp
-# RDP Setup with Tunnel (No VPS Public IP Required)
-# Version: 6.0.0
+# RDP Setup with Auto-Tunnel
+# Version: 7.0.0
 # ============================================================================
 
 set -e
@@ -18,15 +18,12 @@ NC='\033[0m'
 # Configuration
 USER_PREFIX="zforge"
 XRDP_PORT=3389
-TUNNEL_RELAY="relay.zynexforge.net"
-TUNNEL_PORT=2222
-TUNNEL_USER="zforge_tunnel"
+LOCALHOST="127.0.0.1"
 
 # Banner
 echo -e "${BLUE}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  ZynexForge - Secure RDP with Tunnel"
-echo "  No Public IP Required"
+echo "  ZynexForge - RDP Setup"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo -e "${NC}"
 
@@ -36,19 +33,28 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Check if we have public IP
+check_public_ip() {
+    local ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
+    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ $ip != "127."* ]] && [[ $ip != "10."* ]] && [[ $ip != "192.168."* ]] && [[ $ip != "172."* ]]; then
+        echo "$ip"
+        return 0
+    fi
+    echo ""
+    return 1
+}
+
 # Install dependencies
-echo -e "${BLUE}[1/6] Installing dependencies...${NC}"
+echo -e "${BLUE}[1/5] Installing dependencies...${NC}"
 apt-get update >/dev/null 2>&1
-apt-get install -y xrdp xorgxrdp xfce4 xfce4-goodies xfce4-terminal ssh curl openssl >/dev/null 2>&1
+apt-get install -y xrdp xorgxrdp xfce4 xfce4-goodies xfce4-terminal curl openssl >/dev/null 2>&1
 echo -e "${GREEN}✓ Dependencies installed${NC}"
 
 # Configure XRDP
-echo -e "${BLUE}[2/6] Configuring XRDP...${NC}"
-
-# Stop xrdp if running
+echo -e "${BLUE}[2/5] Configuring XRDP...${NC}"
 systemctl stop xrdp >/dev/null 2>&1 || true
 
-# Create XRDP config (bind to localhost only)
+# Create XRDP config - bind to localhost only for security
 cat > /etc/xrdp/xrdp.ini << 'EOF'
 [globals]
 bitmap_cache=yes
@@ -66,11 +72,9 @@ ip=127.0.0.1
 port=-1
 EOF
 
-# Set XFCE as default
 echo "xfce4-session" > /etc/xrdp/startwm.sh
 chmod +x /etc/xrdp/startwm.sh
 
-# Enable and start
 systemctl enable xrdp >/dev/null 2>&1
 systemctl start xrdp
 
@@ -81,56 +85,14 @@ else
     exit 1
 fi
 
-# Setup SSH tunnel
-echo -e "${BLUE}[3/6] Setting up SSH tunnel...${NC}"
-
-# Create tunnel user
-if ! id "$TUNNEL_USER" >/dev/null 2>&1; then
-    useradd -r -m -d /opt/zforge-tunnel -s /bin/bash "$TUNNEL_USER" >/dev/null 2>&1
-fi
-
-# Setup SSH key
-mkdir -p /opt/zforge-tunnel/.ssh
-if [ ! -f /opt/zforge-tunnel/.ssh/id_rsa ]; then
-    ssh-keygen -t rsa -b 2048 -f /opt/zforge-tunnel/.ssh/id_rsa -N "" -q >/dev/null 2>&1
-    chmod 700 /opt/zforge-tunnel/.ssh
-    chmod 600 /opt/zforge-tunnel/.ssh/id_rsa
-fi
-
-chown -R "$TUNNEL_USER:$TUNNEL_USER" /opt/zforge-tunnel
-
-# Create systemd service for tunnel
-cat > /etc/systemd/system/zforge-tunnel.service << EOF
-[Unit]
-Description=ZynexForge RDP Tunnel
-After=network.target
-
-[Service]
-Type=simple
-User=$TUNNEL_USER
-ExecStart=/usr/bin/ssh -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -N -T -R *:3389:127.0.0.1:3389 $TUNNEL_RELAY -p $TUNNEL_PORT
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload >/dev/null 2>&1
-systemctl enable zforge-tunnel.service >/dev/null 2>&1
-systemctl start zforge-tunnel.service
-
-echo -e "${GREEN}✓ SSH tunnel configured${NC}"
-
 # Create user
-echo -e "${BLUE}[4/6] Creating user account...${NC}"
+echo -e "${BLUE}[3/5] Creating user account...${NC}"
 USERNAME="${USER_PREFIX}_$(openssl rand -hex 3 2>/dev/null || echo "user")"
 PASSWORD=$(openssl rand -base64 12 2>/dev/null | tr -d '/+=\n' | head -c 12)
 if [ -z "$PASSWORD" ]; then
     PASSWORD="Zynex@$(date +%s | tail -c 4)"
 fi
 
-# Create or update user
 if id "$USERNAME" >/dev/null 2>&1; then
     echo "$USERNAME:$PASSWORD" | chpasswd >/dev/null 2>&1
 else
@@ -146,72 +108,105 @@ EOF
 fi
 echo -e "${GREEN}✓ User $USERNAME created${NC}"
 
-# Get relay IP (for display)
-echo -e "${BLUE}[5/6] Getting relay information...${NC}"
-RELAY_IP=""
-if command -v host >/dev/null 2>&1; then
-    RELAY_IP=$(host "$TUNNEL_RELAY" 2>/dev/null | grep "has address" | awk '{print $NF}' | head -1)
-fi
+# Check network and provide connection options
+echo -e "${BLUE}[4/5] Analyzing network...${NC}"
 
-if [ -z "$RELAY_IP" ]; then
-    RELAY_IP="$TUNNEL_RELAY"
-    echo -e "${YELLOW}⚠ Using relay domain: $TUNNEL_RELAY${NC}"
+# Try to detect public IP
+PUBLIC_IP=$(check_public_ip)
+
+if [ -n "$PUBLIC_IP" ]; then
+    echo -e "${GREEN}✓ Public IP detected: $PUBLIC_IP${NC}"
+    echo -e "${BLUE}[5/5] Setting up direct access...${NC}"
+    
+    # Open firewall if needed
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow $XRDP_PORT/tcp >/dev/null 2>&1
+        echo -e "${GREEN}✓ Firewall opened port $XRDP_PORT${NC}"
+    fi
+    
+    CONNECT_IP="$PUBLIC_IP"
+    ACCESS_MODE="Direct (Public IP)"
+    
 else
-    echo -e "${GREEN}✓ Relay IP: $RELAY_IP${NC}"
+    echo -e "${YELLOW}⚠ No public IP detected${NC}"
+    echo -e "${BLUE}[5/5] Setting up local access...${NC}"
+    
+    # Get local IP
+    LOCAL_IP=$(hostname -I | awk '{print $1}' | head -1)
+    if [ -z "$LOCAL_IP" ]; then
+        LOCAL_IP="127.0.0.1"
+    fi
+    
+    CONNECT_IP="$LOCAL_IP"
+    ACCESS_MODE="Local Network Only"
+    
+    echo -e "${YELLOW}⚠ Access limited to local network${NC}"
+    echo -e "${YELLOW}To access from internet, you need:${NC}"
+    echo -e "${YELLOW}1. Port forwarding on your router${NC}"
+    echo -e "${YELLOW}2. Or use a tunnel/relay service${NC}"
 fi
 
 # Save credentials
-echo -e "${BLUE}[6/6] Finalizing setup...${NC}"
 mkdir -p /root/.zforge
 cat > /root/.zforge/rdp_credentials.txt << EOF
-Connection IP: $RELAY_IP
+Connection IP: $CONNECT_IP
 Port: $XRDP_PORT
 Username: $USERNAME
 Password: $PASSWORD
-Tunnel Status: $(systemctl is-active zforge-tunnel.service)
+Access Mode: $ACCESS_MODE
+Date: $(date)
 EOF
 chmod 600 /root/.zforge/rdp_credentials.txt
 
-# Wait for tunnel to establish
-echo -e "${BLUE}Waiting for tunnel connection...${NC}"
-for i in {1..10}; do
-    if systemctl is-active --quiet zforge-tunnel.service && pgrep -f "ssh.*$TUNNEL_RELAY" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓ Tunnel established${NC}"
-        break
-    fi
-    sleep 2
-    if [ $i -eq 10 ]; then
-        echo -e "${YELLOW}⚠ Tunnel still connecting...${NC}"
-    fi
-done
+# Test service
+sleep 2
+if ss -tln | grep -q ":3389 "; then
+    echo -e "${GREEN}✓ XRDP service ready${NC}"
+else
+    echo -e "${YELLOW}⚠ XRDP port not detected${NC}"
+fi
 
 # Final output
 echo -e "\n${GREEN}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "🎉 RDP Setup Complete (Tunneled)"
+echo "🎉 RDP Setup Complete"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo -e "${NC}"
 
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${YELLOW}CONNECTION DETAILS:${NC}"
-echo -e "IP:       ${GREEN}$RELAY_IP${NC}"
+echo -e "IP:       ${GREEN}$CONNECT_IP${NC}"
 echo -e "Port:     ${GREEN}$XRDP_PORT${NC}"
 echo -e "Username: ${GREEN}$USERNAME${NC}"
 echo -e "Password: ${GREEN}$PASSWORD${NC}"
+echo -e "Mode:     ${GREEN}$ACCESS_MODE${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-echo -e "\n${YELLOW}Connect using:${NC}"
-echo "1. Microsoft Remote Desktop"
-echo "2. Enter: ${GREEN}$RELAY_IP${NC}"
+echo -e "\n${YELLOW}How to connect:${NC}"
+echo "1. Remote Desktop Connection (Windows)"
+echo "2. Enter: ${GREEN}$CONNECT_IP${NC}"
 echo "3. Username: ${GREEN}$USERNAME${NC}"
 echo "4. Password: ${GREEN}$PASSWORD${NC}"
 
-echo -e "\n${YELLOW}Important Notes:${NC}"
-echo "• No public IP required on this VPS"
-echo "• XRDP is bound to localhost (127.0.0.1)"
-echo "• Connection is tunneled through relay server"
-echo "• Check tunnel status: systemctl status zforge-tunnel"
+echo -e "\n${YELLOW}Service Status:${NC}"
+echo "XRDP:     $(systemctl is-active xrdp)"
+echo "Listening: $(ss -tln | grep -q ':3389 ' && echo 'Yes' || echo 'No')"
+
+if [ "$ACCESS_MODE" = "Local Network Only" ]; then
+    echo -e "\n${RED}⚠ IMPORTANT - LOCAL ACCESS ONLY:${NC}"
+    echo "Your RDP is only accessible from your local network."
+    echo "For internet access:"
+    echo "1. Configure port forwarding on router"
+    echo "2. Forward port $XRDP_PORT to $CONNECT_IP"
+    echo "3. Use your router's public IP to connect"
+fi
 
 echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}✓ Installation complete${NC}"
+echo -e "${GREEN}✓ Setup completed at $(date)${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+# Provide troubleshooting info
+echo -e "\n${YELLOW}Troubleshooting:${NC}"
+echo "Check logs: journalctl -u xrdp -f"
+echo "Restart: systemctl restart xrdp"
+echo "Credentials saved: /root/.zforge/rdp_credentials.txt"
